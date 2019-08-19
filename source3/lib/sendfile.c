@@ -409,7 +409,8 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 
 	off_t	nwritten;
 	ssize_t	ret = -1;
-	bool socket_flags_changed = false;
+	size_t twritten = 0;
+
 
 	if (header) {
 		sf_header.headers = &io_header;
@@ -420,8 +421,16 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 		sf_header.trl_cnt = 0;
 	}
 
-	while (count != 0) {
+	/*
+	 * It is expected that sys_sendfile sends count or fails completely.
+	 * To do this we ensure the socket is in blocking mode.
+	 */
+	old_flags = fcntl(tofd, F_GETFL, 0);
+	if (set_blocking(tofd, true) == -1) {
+		return -1;
+	}
 
+	while (count != 0) {
 		nwritten = count;
 #if defined(DARWIN_SENDFILE_API)
 		/* Darwin recycles nwritten as a value-result parameter, apart from that this
@@ -430,32 +439,17 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 #else
 		ret = sendfile(fromfd, tofd, offset, count, &sf_header, &nwritten, 0);
 #endif
+
 		if (ret == -1 && errno != EINTR) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				/*
-				 * Sendfile must complete before we can
-				 * send any other outgoing data on the socket.
-				 * Ensure socket is in blocking mode.
-				 * For SMB2 by default the socket is in
-				 * non-blocking mode.
-				 */
-				old_flags = fcntl(tofd, F_GETFL, 0);
-				ret = set_blocking(tofd, true);
-				if (ret == -1) {
-					goto out;
-				}
-				socket_flags_changed = true;
-				continue;
-			}
-			/* Send failed, we are toast. */
-			ret = -1;
-			goto out;
+			break;
 		}
 
 		if (nwritten == 0) {
 			/* EOF of offset is after EOF. */
 			break;
 		}
+
+		twritten += nwritten;
 
 		if (sf_header.hdr_cnt) {
 			if (io_header.iov_len <= nwritten) {
@@ -474,27 +468,11 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 
 		offset += nwritten;
 		count -= nwritten;
+		ret = twritten;
 	}
 
-	ret = nwritten;
-
-  out:
-
-	if (socket_flags_changed) {
-		int saved_errno;
-		int err;
-
-		if (ret == -1) {
-			saved_errno = errno;
-		}
-		/* Restore the old state of the socket. */
-		err = fcntl(tofd, F_SETFL, old_flags);
-		if (err == -1) {
-			return -1;
-		}
-		if (ret == -1) {
-			errno = saved_errno;
-		}
+	if (fcntl(tofd, F_SETFL, old_flags) == -1) {
+		return -1;
 	}
 
 	return ret;
