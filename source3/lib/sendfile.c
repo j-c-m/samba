@@ -398,15 +398,24 @@ ssize_t sys_sendfile(int tofd, int fromfd, const DATA_BLOB *header, off_t offset
 #include <sys/uio.h>
 
 ssize_t sys_sendfile(int tofd, int fromfd,
-	    const DATA_BLOB *header, off_t offset, size_t count)
+		const DATA_BLOB *header, off_t offset, size_t count)
 {
 	struct sf_hdtr	sf_header = {0};
 	struct iovec	io_header = {0};
-	int old_flags = 0;
 
 	off_t	nwritten;
 	ssize_t	ret = -1;
-	bool socket_flags_changed = false;
+	int		socket_flags;
+	off_t	total = 0;
+	size_t	header_len = 0;
+
+	if ((socket_flags = fcntl(tofd, F_GETFL, 0)) == -1) {
+		return -1;
+	}
+
+	if (set_blocking(tofd, true) == -1) {
+		return -1;
+	}
 
 	if (header) {
 		sf_header.headers = &io_header;
@@ -415,83 +424,46 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 		io_header.iov_len = header->length;
 		sf_header.trailers = NULL;
 		sf_header.trl_cnt = 0;
+
+		header_len = header->length;
+	} else {
+		io_header.iov_len = 0;
 	}
 
-	while (count != 0) {
 
-		nwritten = count;
+	while (total < count + header_len) {
+		nwritten = count - total + header_len - io_header.iov_len;
 #if defined(DARWIN_SENDFILE_API)
 		/* Darwin recycles nwritten as a value-result parameter, apart from that this
 		   sendfile implementation is quite the same as the FreeBSD one */
-		ret = sendfile(fromfd, tofd, offset, &nwritten, &sf_header, 0);
+		ret = sendfile(fromfd, tofd,
+				offset + total - header_len + io_header.iov_len, &nwritten,
+				&sf_header, 0);
 #else
-		ret = sendfile(fromfd, tofd, offset, count, &sf_header, &nwritten, 0);
+		ret = sendfile(fromfd, tofd,
+				offset + total - header_len + io_header.iov_len,
+				count - total + header_len - io_header.iov_len,
+				&sf_header, &nwritten, 0);
 #endif
-		if (ret == -1 && errno != EINTR) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				/*
-				 * Sendfile must complete before we can
-				 * send any other outgoing data on the socket.
-				 * Ensure socket is in blocking mode.
-				 * For SMB2 by default the socket is in
-				 * non-blocking mode.
-				 */
-				old_flags = fcntl(tofd, F_GETFL, 0);
-				ret = set_blocking(tofd, true);
-				if (ret == -1) {
-					goto out;
-				}
-				socket_flags_changed = true;
-				continue;
-			}
-			/* Send failed, we are toast. */
-			ret = -1;
-			goto out;
-		}
+		total += nwritten;
 
-		if (nwritten == 0) {
-			/* EOF of offset is after EOF. */
+		if (ret == -1 && errno != EINTR && errno != EAGAIN) {
+			total = -1;
 			break;
 		}
 
-		if (sf_header.hdr_cnt) {
-			if (io_header.iov_len <= nwritten) {
-				/* Entire header was sent. */
-				sf_header.headers = NULL;
-				sf_header.hdr_cnt = 0;
-				nwritten -= io_header.iov_len;
-			} else {
-				/* Partial header was sent. */
-				io_header.iov_len -= nwritten;
-				io_header.iov_base =
-				    ((uint8_t *)io_header.iov_base) + nwritten;
-				nwritten = 0;
-			}
+		if (io_header.iov_len <= total) {
+			io_header.iov_len = 0;
+		} else {
+			/* Partial header send */
+			io_header.iov_len -= nwritten;
+			io_header.iov_base = ((uint8_t *)io_header.iov_base) + nwritten;
 		}
-
-		offset += nwritten;
-		count -= nwritten;
+		ret = total;
 	}
 
-	ret = nwritten;
-
-  out:
-
-	if (socket_flags_changed) {
-		int saved_errno;
-		int err;
-
-		if (ret == -1) {
-			saved_errno = errno;
-		}
-		/* Restore the old state of the socket. */
-		err = fcntl(tofd, F_SETFL, old_flags);
-		if (err == -1) {
-			return -1;
-		}
-		if (ret == -1) {
-			errno = saved_errno;
-		}
+	if(fcntl(tofd, F_SETFL, socket_flags) == -1) {
+		return -1;
 	}
 
 	return ret;
