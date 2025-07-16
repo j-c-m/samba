@@ -249,11 +249,13 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 	struct sf_hdtr	sf_header = {0};
 	struct iovec	io_header = {0};
 
-	off_t	nwritten;
+	off_t nwritten;
 	int	ret;
-	int val;
+	int socket_fl;
+    off_t total = 0;
+    size_t header_len = 0;
 
-	if((val = fcntl(tofd, F_GETFL, 0)) == -1) {
+	if((socket_fl = fcntl(tofd, F_GETFL, 0)) == -1) {
 		return -1;
 	}
 
@@ -268,26 +270,44 @@ ssize_t sys_sendfile(int tofd, int fromfd,
 		io_header.iov_len = header->length;
 		sf_header.trailers = NULL;
 		sf_header.trl_cnt = 0;
-	}
 
-	nwritten = count;
+        header_len = header->length;
+	} else {
+        io_header.iov_len = 0;
+    }
+
+    while (total < count + header_len)
+    {
+    	nwritten = count - total + header_len - io_header.iov_len;
 #if defined(DARWIN_SENDFILE_API)
-	/* Darwin recycles nwritten as a value-result parameter, apart from that this
-		sendfile implementation is quite the same as the FreeBSD one */
-	ret = sendfile(fromfd, tofd, offset, &nwritten, &sf_header, 0);
+    	/* Darwin recycles nwritten as a value-result parameter, apart from that this
+    		sendfile implementation is quite the same as the FreeBSD one */
+    	ret = sendfile(fromfd, tofd, offset + total - header_len + io_header.iov_len, &nwritten, &sf_header, 0);
 #else
-	ret = sendfile(fromfd, tofd, offset, count, &sf_header, &nwritten, 0);
+    	ret = sendfile(fromfd, tofd, offset + total - header_len + io_header.iov_len, 
+                count - total + header_len - io_header.iov_len, &sf_header, &nwritten, 0);
 #endif
 
-	if (fcntl(tofd, F_SETFL, val) == -1) {
+        total += nwritten;
+
+        if (ret == -1 && errno != EINTR && errno != EAGAIN) {
+            total = -1;
+            break;
+        }
+
+        if (io_header.iov_len <= total) {
+            io_header.iov_len = 0;
+        } else {
+            io_header.iov_len -= nwritten;
+            io_header.iov_base = ((uint8_t *)io_header.iov_base) + nwritten;
+        }
+    }
+
+    if (fcntl(tofd, F_SETFL, socket_fl) == -1) {
 		return -1;
 	}
 
-	if (ret == -1 && errno != EINTR) {
-		return -1;
-	}
-
-	return nwritten;
+	return total;
 }
 
 #elif defined(AIX_SENDFILE_API)
